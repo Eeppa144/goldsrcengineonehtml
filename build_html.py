@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-build_html.py - assemble cs16-offline.html
+build_html.py - assemble self-contained GoldSrc-web HTML builds (Universal build)
 
 Embeds the WebXash3D-FWGS engine (xash.wasm + side modules + raw.js glue) and
-the CS 1.6 game archives (valve.zip / cstrike.zip) into ONE self-contained
-HTML file. Payloads are streamed to disk in 3 MiB chunks and base64-encoded
-on the fly - no archive is ever fully resident in RAM.
+the game archives required by the selected GAME DEFINITION into ONE
+self-contained HTML file. Payloads are streamed to disk in 3 MiB chunks and
+base64-encoded on the fly - no archive is ever fully resident in RAM.
+
+Game modes are defined in the GAMES dictionary below (game_dir, engine_args,
+payloads, engine module set). Pick one with --game; only the payloads listed
+for that game are base64-encoded, and the matching engine_args are injected
+into the CONFIG block the loader template reads at boot.
 
 Game archives are normalized so that the engine's archive scanner finds them.
 Xash3D FWGS filesystem semantics (FWGS/xash3d-fwgs filesystem/searchpath.c):
   - FS_AddGameHierarchy mounts <rootdir>/<dir>/ and <rodir>/<dir>/ for each
-    game dir ("valve" base + "cstrike" gamedir); it scans ONLY those folders
+    game dir ("valve" base + "<gamedir>"); it scans ONLY those folders
     for *.pak / *.pk3 / *.wad files and mounts each as an archive;
   - archive entries are looked up VERBATIM by bare name (FS_FindFile ->
     search->pfnFindFile), so a pk3 must contain gamedir-relative paths
@@ -18,15 +23,18 @@ Xash3D FWGS filesystem semantics (FWGS/xash3d-fwgs filesystem/searchpath.c):
     The engine's own extras.pk3 follows exactly this bare convention.
 Therefore we repack:
   valve.zip   (entries valve/...)   -> /rodir/valve/valve.pk3   (bare entries)
-  cstrike.zip (entries cstrike/...) -> /rodir/cstrike/cstrike.pk3 (bare entries)
+  cstrike.zip (entries cstrike/...) -> /rodir/cstrike/cstrike.pk3
+  dod.zip (entries dod/...)         -> /rodir/dod/dod.pk3       (bare entries)
 The tiny mod-discovery files (liblist.gam / gameinfo.txt) are extracted and
-embedded as real files (valve/liblist.gam, cstrike/liblist.gam) because mod
-discovery reads them from the mounted game directories.
+embedded as real files (valve/liblist.gam, cstrike/liblist.gam, ...) because
+mod discovery reads them from the mounted game directories.
 
 Usage:
-  python3 build_html.py [--game-dir GAME] [--engine-dir DIR]
+  python3 build_html.py --game cstrike|valve|dod
+                        [--game-dir GAME] [--engine-dir DIR]
                         [--template FILE] [--out FILE]
-                        [--valve-zip FILE] [--cstrike-zip FILE] [--skip-verify]
+                        [--valve-zip FILE] [--cstrike-zip FILE] [--dod-zip FILE]
+                        [--list-games] [--skip-verify]
 """
 import argparse
 import base64
@@ -38,20 +46,41 @@ import sys
 import tempfile
 import zipfile
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.abspath(__file__))
 CHUNK = 3 * 1024 * 1024  # multiple of 3 -> exactly 4 MiB of base64 chars, padding only at EOF
 
-ENGINE_FILES = [
-    # (tag id, file, locateFile key, label)
-    ('b64-xash',    'xash.wasm',                     'xash.wasm',                             'xash.wasm (engine core)'),
-    ('b64-fs',      'filesystem_stdio.wasm',         'filesystem_stdio.wasm',                 'filesystem_stdio.wasm (FS module)'),
-    ('b64-ref',     'libref_gles3compat.wasm',       'libref_gles3compat.wasm',               'libref_gles3compat.wasm (WebGL renderer)'),
-    ('b64-menu',    'menu_emscripten_wasm32.wasm',   'cl_dlls/menu_emscripten_wasm32.wasm',   'menu_emscripten_wasm32.wasm (CS menu)'),
-    ('b64-client',  'client_emscripten_wasm32.wasm', 'cl_dlls/client_emscripten_wasm32.wasm', 'client_emscripten_wasm32.wasm (CS client)'),
-    ('b64-cs',      'cs_emscripten_wasm32.so',       'dlls/cs_emscripten_wasm32.so',          'cs_emscripten_wasm32.so (CS server)'),
-    ('b64-yapb',    'yapb_emscripten_wasm32.wasm',   'dlls/yapb_emscripten_wasm32.so',        'yapb_emscripten_wasm32 (YaPB bot AI)'),
+# ---------------------------------------------------------------------------
+# Engine modules.
+# A set = engine core + FS + renderer (shared) + per-game menu/client/server
+# side modules. Each entry: (tag id, file in engine-dir, locateFile key, label)
+# ---------------------------------------------------------------------------
+ENGINE_FILES_BASE = [
+    ('b64-xash', 'xash.wasm', 'xash.wasm', 'xash.wasm (engine core)'),
+    ('b64-fs', 'filesystem_stdio.wasm', 'filesystem_stdio.wasm', 'filesystem_stdio.wasm (FS module)'),
+    ('b64-ref', 'libref_gles3compat.wasm', 'libref_gles3compat.wasm', 'libref_gles3compat.wasm (WebGL renderer)'),
 ]
-DYNAMIC_LIBRARIES = [
+ENGINE_FILES_MENU = [
+    ('b64-menu', 'menu_emscripten_wasm32.wasm', 'cl_dlls/menu_emscripten_wasm32.wasm',
+     'menu_emscripten_wasm32.wasm (menu)'),
+]
+ENGINE_FILES_CLIENT = [
+    ('b64-client', 'client_emscripten_wasm32.wasm', 'cl_dlls/client_emscripten_wasm32.wasm',
+     'client_emscripten_wasm32.wasm (client dll)'),
+]
+
+# -dll: verbatim gamedll override - this engine build has no '@name' syntax
+# and appends no postfix, so pass the exact LDSO key of the preloaded server
+# side module. The dest/registered name uses the .so extension so the
+# engine-generated gamedll name matches the Emscripten LDSO registry key
+# exactly (extension is irrelevant - the loader checks the wasm dylink magic).
+
+ENGINE_FILES_CS = (ENGINE_FILES_BASE + ENGINE_FILES_MENU + ENGINE_FILES_CLIENT + [
+    ('b64-cs', 'cs_emscripten_wasm32.so', 'dlls/cs_emscripten_wasm32.so',
+     'cs_emscripten_wasm32.so (CS server)'),
+    ('b64-yapb', 'yapb_emscripten_wasm32.wasm', 'dlls/yapb_emscripten_wasm32.so',
+     'yapb_emscripten_wasm32 (YaPB bot AI)'),
+])
+DYNAMIC_LIBRARIES_CS = [
     'filesystem_stdio.wasm',
     'libref_gles3compat.wasm',
     'cl_dlls/menu_emscripten_wasm32.wasm',
@@ -59,14 +88,94 @@ DYNAMIC_LIBRARIES = [
     'cl_dlls/client_emscripten_wasm32.wasm',
     '/rwdir/filesystem_stdio.so',
     # YaPB bot manager: loaded as an Emscripten side module; the engine then
-    # opens it as the server game DLL via -dll @yapb (cs16-client convention),
-    # and yapb itself dlopens the real CS server lib through XASH3D_GAMELIBPATH
-    # (set via Module.ENV in the loader template). The dest/registered name
-    # uses the .so extension so the engine-generated gamedll name matches the
-    # Emscripten LDSO registry key exactly (extension is irrelevant - the
-    # loader checks the wasm dylink magic).
+    # opens it as the server game DLL via -dll (cs16-client convention), and
+    # yapb itself dlopens the real CS server lib through XASH3D_GAMELIBPATH
+    # (set via Module.ENV in the loader template).
     'dlls/yapb_emscripten_wasm32.so',
 ]
+
+ENGINE_FILES_HL = (ENGINE_FILES_BASE + ENGINE_FILES_MENU + ENGINE_FILES_CLIENT + [
+    ('b64-hl', 'hl_emscripten_wasm32.so', 'dlls/hl_emscripten_wasm32.so',
+     'hl_emscripten_wasm32.so (HL server)'),
+])
+DYNAMIC_LIBRARIES_HL = [
+    'filesystem_stdio.wasm',
+    'libref_gles3compat.wasm',
+    'cl_dlls/menu_emscripten_wasm32.wasm',
+    'dlls/hl_emscripten_wasm32.so',
+    'cl_dlls/client_emscripten_wasm32.wasm',
+    '/rwdir/filesystem_stdio.so',
+]
+
+ENGINE_FILES_DOD = (ENGINE_FILES_BASE + ENGINE_FILES_MENU + ENGINE_FILES_CLIENT + [
+    ('b64-dod', 'dod_emscripten_wasm32.so', 'dlls/dod_emscripten_wasm32.so',
+     'dod_emscripten_wasm32.so (DoD server)'),
+])
+DYNAMIC_LIBRARIES_DOD = [
+    'filesystem_stdio.wasm',
+    'libref_gles3compat.wasm',
+    'cl_dlls/menu_emscripten_wasm32.wasm',
+    'dlls/dod_emscripten_wasm32.so',
+    'cl_dlls/client_emscripten_wasm32.wasm',
+    '/rwdir/filesystem_stdio.so',
+]
+
+# ---------------------------------------------------------------------------
+# Universal game definitions.
+#   game_dir:         gamedir passed to the engine via -game (also the mod
+#                     folder name the archives are normalized against)
+#   engine_args:      full argv injected into CONFIG.args; the loader template
+#                     passes it verbatim to the Xash3D engine on boot
+#   payloads:         game archives to embed (each <name> is read from
+#                     <game-dir>/<name>.zip or --<name>-zip and embedded as
+#                     /rodir/<name>/<name>.pk3). "valve" is the Half-Life
+#                     base data every GoldSrc mod needs.
+#   game_lib_path:    XASH3D_GAMELIBPATH env value for the loader (the real
+#                     server lib a wrapper bot dll dlopens; must match the
+#                     LDSO registry key in dynamic_libraries)
+#   engine_files:     which engine side modules this game needs
+#   dynamic_libraries: CONFIG.dynamicLibraries for the loader
+# ---------------------------------------------------------------------------
+GAMES = {
+    'cstrike': {
+        'title': 'Counter-Strike 1.6',
+        'game_dir': 'cstrike',
+        'engine_args': ['-windowed', '-game', 'cstrike',
+                        '-dll', 'dlls/yapb_emscripten_wasm32.so',
+                        '+_vgui_menus', '0'],
+        'payloads': ['valve', 'cstrike'],
+        'game_lib_path': 'dlls/cs_emscripten_wasm32.so',
+        'engine_files': ENGINE_FILES_CS,
+        'dynamic_libraries': DYNAMIC_LIBRARIES_CS,
+    },
+    'valve': {
+        'title': 'Half-Life',
+        'game_dir': 'valve',
+        'engine_args': ['-windowed', '-game', 'valve',
+                        '-dll', 'dlls/hl_emscripten_wasm32.so'],
+        'payloads': ['valve'],
+        'game_lib_path': 'dlls/hl_emscripten_wasm32.so',
+        'engine_files': ENGINE_FILES_HL,
+        'dynamic_libraries': DYNAMIC_LIBRARIES_HL,
+    },
+    'dod': {
+        'title': 'Day of Defeat',
+        'game_dir': 'dod',
+        'engine_args': ['-windowed', '-game', 'dod',
+                        '-dll', 'dlls/dod_emscripten_wasm32.so'],
+        'payloads': ['valve', 'dod'],
+        'game_lib_path': 'dlls/dod_emscripten_wasm32.so',
+        'engine_files': ENGINE_FILES_DOD,
+        'dynamic_libraries': DYNAMIC_LIBRARIES_DOD,
+    },
+}
+
+PAYLOAD_LABELS = {
+    'valve': 'valve.pk3 (Half-Life base data)',
+    'cstrike': 'cstrike.pk3 (Counter-Strike data)',
+    'dod': 'dod.pk3 (Day of Defeat data)',
+}
+PAYLOAD_DEFAULT_LABEL = '{name}.pk3 ({game} data)'
 
 
 def norm_name(name):
@@ -201,8 +310,12 @@ def verify_tag(out_path, tag_id, start, end, src_path=None, src_bytes=None):
     if src_path:
         with open(src_path, 'rb') as f:
             src_head = f.read(len(head_dec))
-            f.seek(max(0, size - len(tail_dec)))
-            src_tail = f.read()[-len(tail_dec):] if len(tail_dec) else b''
+            if len(tail_dec) >= size:
+                f.seek(0)
+                src_tail = f.read()
+            else:
+                f.seek(-len(tail_dec), 2)
+                src_tail = f.read()
     else:
         src_head = src_bytes[:len(head_dec)]
         src_tail = src_bytes[-len(tail_dec):] if len(tail_dec) else b''
@@ -213,24 +326,55 @@ def verify_tag(out_path, tag_id, start, end, src_path=None, src_bytes=None):
     return None
 
 
-def main():
+def list_games():
+    print(json.dumps(GAMES, indent=2))
+
+
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    ap.add_argument('--game', choices=sorted(GAMES), default='cstrike',
+                    help='game mode to build (default: cstrike)')
     ap.add_argument('--game-dir', default=os.path.join(ROOT, 'game'))
     ap.add_argument('--engine-dir', default=os.path.join(ROOT, 'engine', 'webxash'))
-    ap.add_argument('--template', default=os.path.join(ROOT, 'scripts', 'template.html'))
-    ap.add_argument('--out', default=os.path.join(ROOT, 'download', 'cs16-offline.html'))
-    ap.add_argument('--valve-zip', default=None)
-    ap.add_argument('--cstrike-zip', default=None)
+    ap.add_argument('--template', default=os.path.join(ROOT, 'template.html'))
+    ap.add_argument('--out', default=None,
+                    help='output HTML (default: download/<game>-offline.html; '
+                         'cs16-offline.html for --game cstrike)')
+    for name in sorted({p for g in GAMES.values() for p in g['payloads']}):
+        ap.add_argument(f'--{name}-zip', default=None,
+                        help=f'path to {name}.zip (default: <game-dir>/{name}.zip)')
+    ap.add_argument('--list-games', action='store_true',
+                    help='print the game definition dictionary and exit')
     ap.add_argument('--skip-verify', action='store_true')
+    return ap
+
+
+def main():
+    ap = build_parser()
     args = ap.parse_args()
 
-    valve_src = args.valve_zip or os.path.join(args.game_dir, 'valve.zip')
-    cstrike_src = args.cstrike_zip or os.path.join(args.game_dir, 'cstrike.zip')
-    for f in (valve_src, cstrike_src):
-        if not os.path.isfile(f):
-            raise SystemExit(f'missing game archive: {f}\n'
-                             f'(torrent download unavailable - provide the zips via --valve-zip/--cstrike-zip)')
-    for tag, fname, _, _ in ENGINE_FILES:
+    if args.list_games:
+        list_games()
+        return
+
+    game = GAMES[args.game]
+    game_dir_name = game['game_dir']
+
+    if args.out is None:
+        out_name = 'cs16-offline.html' if args.game == 'cstrike' else f'{args.game}-offline.html'
+        args.out = os.path.join(ROOT, 'download', out_name)
+
+    engine_files = game['engine_files']
+    payload_names = game['payloads']
+
+    payload_srcs = {}
+    for name in payload_names:
+        src = getattr(args, f'{name}_zip') or os.path.join(args.game_dir, f'{name}.zip')
+        if not os.path.isfile(src):
+            raise SystemExit(f'missing game archive for {args.game}: {src}\n'
+                             f'(provide it via --{name}-zip or place {name}.zip in --game-dir)')
+        payload_srcs[name] = src
+    for tag, fname, _, _ in engine_files:
         p = os.path.join(args.engine_dir, fname)
         if not os.path.isfile(p):
             raise SystemExit(f'missing engine file: {p}')
@@ -240,13 +384,13 @@ def main():
     if '</script' in raw_js.lower():
         raise SystemExit('raw.js contains a literal </script - cannot inline safely')
 
-    print('== normalizing game archives ==')
-    valve_path, valve_gi_n, valve_gi_b, valve_extras = normalize_archive(
-        valve_src, 'valve', os.path.join(args.game_dir, 'valve.pk3'))
-    cstrike_path, cs_gi_n, cs_gi_b, cs_extras = normalize_archive(
-        cstrike_src, 'cstrike', os.path.join(args.game_dir, 'cstrike.pk3'))
-    print(f'  valve:   {valve_path}  gi={valve_gi_n} extras_in_zip={valve_extras}')
-    print(f'  cstrike: {cstrike_path}  gi={cs_gi_n} extras_in_zip={cs_extras}')
+    print(f'== normalizing game archives (game: {args.game} - {game["title"]}) ==')
+    normalized = {}
+    for name in payload_names:
+        path, gi_n, gi_b, extras = normalize_archive(
+            payload_srcs[name], name, os.path.join(args.game_dir, f'{name}.pk3'))
+        normalized[name] = (path, gi_n, gi_b, extras)
+        print(f'  {name}: {path}  gi={gi_n} extras_in_zip={extras}')
 
     print('== embedding ==')
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
@@ -275,36 +419,34 @@ def main():
             gameinfo.append(entry)
         tags.append(('bytes', tag_id, data))
 
-    for tag_id, fname, dest, label in ENGINE_FILES:
+    for tag_id, fname, dest, label in engine_files:
         add_path_payload(tag_id, os.path.join(args.engine_dir, fname), 'bytes', dest, label)
 
-    add_path_payload('b64-valve', valve_path, 'file', '/rodir/valve/valve.pk3', 'valve.pk3 (Half-Life base data)')
-    add_path_payload('b64-cstrike', cstrike_path, 'file', '/rodir/cstrike/cstrike.pk3', 'cstrike.pk3 (Counter-Strike data)')
+    for name in payload_names:
+        path, gi_n, gi_b, _ = normalized[name]
+        label = PAYLOAD_LABELS.get(name, PAYLOAD_DEFAULT_LABEL.format(name=name, game=game['title']))
+        add_path_payload(f'b64-{name}', path, 'file', f'/rodir/{name}/{name}.pk3', label)
+        if gi_b:
+            add_bytes_payload(f'b64-gi-{name}', gi_b, 'file',
+                              f'/rodir/{name}/{os.path.basename(gi_n)}',
+                              f'{gi_n} (mod discovery)', into_payloads=False)
 
-    if not valve_extras and os.path.isfile(extras_path):
-        add_path_payload('b64-extras', extras_path, 'file', '/rodir/valve/extras.pk3',
-                         'extras.pk3 (engine extras)')
-    elif valve_extras:
-        print('  valve.zip already contains extras.pk3 - skipping engine extras')
-
-    if valve_gi_b:
-        add_bytes_payload('b64-gi-valve', valve_gi_b, 'file',
-                          f'/rodir/valve/{os.path.basename(valve_gi_n)}',
-                          f'{valve_gi_n} (mod discovery)', into_payloads=False)
-    if cs_gi_b:
-        add_bytes_payload('b64-gi-cstrike', cs_gi_b, 'file',
-                          f'/rodir/cstrike/{os.path.basename(cs_gi_n)}',
-                          f'{cs_gi_n} (mod discovery)', into_payloads=False)
+    if 'valve' in payload_names:
+        valve_extras = normalized['valve'][3]
+        if not valve_extras and os.path.isfile(extras_path):
+            add_path_payload('b64-extras', extras_path, 'file', '/rodir/valve/extras.pk3',
+                             'extras.pk3 (engine extras)')
+        elif valve_extras:
+            print('  valve archive already contains extras.pk3 - skipping engine extras')
 
     config = {
+        'game': args.game,
+        'title': game['title'],
+        'gameDir': game_dir_name,
         'mountDir': '/rodir',
-        # -dll: verbatim gamedll override - this engine build has no '@name'
-        # syntax and appends no postfix, so pass the exact LDSO key of the
-        # preloaded YaPB side module (cs16-client convention would be
-        # '-dll @yapb', which this engine binary treats as a literal path).
-        'args': ['-windowed', '-game', 'cstrike', '-dll', 'dlls/yapb_emscripten_wasm32.so',
-                 '+_vgui_menus', '0'],
-        'dynamicLibraries': DYNAMIC_LIBRARIES,
+        'gameLibPath': game['game_lib_path'],
+        'args': game['engine_args'],
+        'dynamicLibraries': game['dynamic_libraries'],
         'payloads': payloads,
         'gameinfo': gameinfo,
     }
