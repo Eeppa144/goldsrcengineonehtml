@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Counter-Strike 1.6 - Offline (Xash3D FWGS / WebAssembly)</title>
+<title>GoldSrc Offline (Xash3D FWGS / WebAssembly)</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <link rel="icon" href="data:,">
 <style>
@@ -157,8 +157,8 @@
   </div>
 </div>
 <div id="overlay">
-  <h1>COUNTER-STRIKE 1.6</h1>
-  <div class="sub">Xash3D FWGS (WebAssembly) &mdash; single-file offline build, no network requests</div>
+  <h1 id="overlay-title">GOLDSRC ENGINE</h1>
+  <div class="sub" id="overlay-sub">Xash3D FWGS (WebAssembly) &mdash; single-file offline build, no network requests</div>
   <div id="panel">
     <div id="rows"></div>
     <div class="track" id="overall-track"><div class="fill" id="overall-fill"></div></div>
@@ -169,7 +169,7 @@
       <button id="btn-full" type="button">Go Fullscreen</button>
       <button id="btn-win" type="button">Play in Window</button>
     </div>
-    <div class="hint">Click the game canvas to capture the mouse (pointer lock) &middot; ESC releases it<br>The game boots at your window size and always fits your screen (letterboxed, never cropped)<br>If the picture is ever oversized, cropped or shifted &mdash; press <b>- (minus)</b> for the manual screen-adjust panel<br>Press <b>. (dot)</b> for the developer console (runs engine commands) &middot; append <b>#res=1920x1080</b> to force the boot resolution</div>
+    <div class="hint">Click the game canvas to capture the mouse (pointer lock) &middot; ESC releases it<br>The game boots at your window size and always fits your screen (letterboxed, never cropped)<br>If the picture is ever oversized, cropped or shifted &mdash; press <b>- (minus)</b> for the manual screen-adjust panel<br>Press <b>. (dot)</b> for the developer console (runs engine commands) &middot; append <b>#res=1920x1080</b> to force the boot resolution &middot; append <b>#fixvp=1</b> to force the viewport guard on</div>
   </div>
   <noscript>JavaScript is required to run the game.</noscript>
 </div>
@@ -198,7 +198,7 @@
    * nor canvas/window resize events change the framebuffer afterwards.
    * (All three were verified empirically on this wasm build.) So:
    *   1. measure the browser window at startup and boot the engine at
-   *      exactly that size -> the CS menu is drawn 1:1 for the user's
+   *      exactly that size -> the menu is drawn 1:1 for the user's
    *      screen, never oversized, cropped or stretched;
    *   2. the canvas element always fills the window via CSS
    *      (100vw/100vh + object-fit: contain), so if the viewport changes
@@ -240,7 +240,7 @@
     elLog.textContent += msg + '\n';
     if (elLog.textContent.length > 60000) elLog.textContent = elLog.textContent.slice(-40000);
     elLog.scrollTop = elLog.scrollHeight;
-    try { console.log('[cs16] ' + msg); } catch (e) {} /* stay visible after overlay removal */
+    try { console.log('[goldsrc] ' + msg); } catch (e) {} /* stay visible after overlay removal */
   }
   function fatal(msg) {
     var t = (msg && msg.message) ? msg.message : String(msg);
@@ -257,6 +257,11 @@
   var CFG;
   try { CFG = JSON.parse(document.getElementById('cfg-json').textContent); }
   catch (e) { fatal('configuration parse failed: ' + e); return; }
+
+  if (CFG.title) {
+    document.getElementById('overlay-title').textContent = CFG.title.toUpperCase();
+    document.title = CFG.title + ' - Offline (Xash3D FWGS / WebAssembly)';
+  }
 
   var payloads = (CFG.payloads || []).concat(CFG.gameinfo || []);
   var totalBytes = 0, doneBytes = 0;
@@ -403,7 +408,7 @@
     });
 
     FS.chdir(CFG.mountDir);
-    log('FS cwd set to ' + CFG.mountDir + ' - engine will auto-mount valve.pk3 / cstrike.pk3');
+    log('FS cwd set to ' + CFG.mountDir + ' - engine will auto-mount archives');
   }
 
   function installHook() { /* registered as Module.preRun */
@@ -468,6 +473,9 @@
    * off. The guard detects that mismatch (twice in a row, to skip
    * transient init states) and grows the bitmap to the engine's real
    * render size, which restores the full picture automatically.
+   * This guard is now OPT-IN via #fixvp=1 because resizing the canvas
+   * bitmap while the engine is rendering can cause visual artifacts.
+   * Boot-time auto-fit handles the primary resolution setup.
    *
    * Layer 3 (manual fallback, user-requested): pressing "-" opens a
    * panel with zoom / horizontal / vertical sliders (plus drag-to-pan
@@ -895,25 +903,32 @@
         if (st.getPropertyValue('object-fit') !== 'contain') st.setProperty('object-fit', 'contain', 'important');
       } catch (e) {}
     }, 700);
-    var lastVpMiss = null;
-    setInterval(function () { /* render guard */
-      try {
-        if (!glCtx) return;
-        var vp = glCtx.getParameter(glCtx.VIEWPORT);
-        if (!vp || vp.length < 4 || vp[0] !== 0 || vp[1] !== 0) { lastVpMiss = null; return; }
-        var w = vp[2] | 0, h = vp[3] | 0;
-        if (w > 0 && h > 0 && (w > canvas.width || h > canvas.height)) {
-          /* require the mismatch twice in a row - skips transient init states */
-          if (lastVpMiss && lastVpMiss[0] === w && lastVpMiss[1] === h) {
-            log('render guard: engine renders ' + w + 'x' + h + ' but framebuffer is ' +
-                canvas.width + 'x' + canvas.height +
-                ' (bottom-left clip = oversized/cropped menu) - growing buffer to match');
-            canvas.width = w; canvas.height = h;
-            lastVpMiss = null;
-          } else lastVpMiss = [w, h];
-        } else lastVpMiss = null;
-      } catch (e) { lastVpMiss = null; }
-    }, 1200);
+
+    /* Render guard (auto-repair loop): OPT-IN via #fixvp=1. The engine owns
+       the viewport/framebuffer; forcing canvas.width/height from outside
+       fights it (GL_INVALID_OPERATION / rendering artifacts). Boot-time
+       auto-fit above remains the default behavior. */
+    if (location.hash.indexOf('fixvp=1') !== -1) {
+      var lastVpMiss = null;
+      setInterval(function () { /* render guard */
+        try {
+          if (!glCtx) return;
+          var vp = glCtx.getParameter(glCtx.VIEWPORT);
+          if (!vp || vp.length < 4 || vp[0] !== 0 || vp[1] !== 0) { lastVpMiss = null; return; }
+          var w = vp[2] | 0, h = vp[3] | 0;
+          if (w > 0 && h > 0 && (w > canvas.width || h > canvas.height)) {
+            /* require the mismatch twice in a row - skips transient init states */
+            if (lastVpMiss && lastVpMiss[0] === w && lastVpMiss[1] === h) {
+              log('render guard: engine renders ' + w + 'x' + h + ' but framebuffer is ' +
+                  canvas.width + 'x' + canvas.height +
+                  ' (bottom-left clip = oversized/cropped menu) - growing buffer to match');
+              canvas.width = w; canvas.height = h;
+              lastVpMiss = null;
+            } else lastVpMiss = [w, h];
+          } else lastVpMiss = null;
+        } catch (e) { lastVpMiss = null; }
+      }, 1200);
+    }
   }
 
   async function main() {
@@ -933,7 +948,13 @@
       log('boot resolution: ' + bootRes[0] + 'x' + bootRes[1] +
           (location.hash.indexOf('res=') >= 0 ? ' (manual #res override)' : ' (auto-fit window)'));
       elPhase.textContent = 'Creating WebGL2 context...';
-      var gl = canvas.getContext('webgl2', { alpha: false, depth: true, stencil: true, antialias: true });
+      /* antialias:false is critical: the engine's GLES3compat renderer uses
+         blit/readPixels against the default framebuffer assuming it's NOT
+         multisampled. A mismatched multisample state causes GL_INVALID_OPERATION
+         spams and rendering artifacts (banding, stale frames). */
+      var gl = canvas.getContext('webgl2', { alpha: false, depth: true, stencil: true,
+                                             antialias: false, preserveDrawingBuffer: false,
+                                             powerPreference: 'high-performance' });
       if (!gl) throw new Error('WebGL2 is not available. Enable hardware acceleration or use an up-to-date Chrome/Edge/Firefox.');
       glCtx = gl; /* shared with the engine - the render guard reads its viewport */
 
@@ -959,7 +980,9 @@
         canvas: canvas,
         ctx: gl,
         noFSInit: true,
-        wasmBinary: decoded['b64-xash'] ? decoded['b64-xash'].bytes : null,
+        wasmBinary: decoded['b64-xash']
+                    ? (decoded['b64-xash'].bytes || concatChunks(decoded['b64-xash'].chunks))
+                    : null,
         locateFile: locateFile,
         dynamicLibraries: CFG.dynamicLibraries || [],
         /* YaPB (bot AI side module) reads this env var to find the real CS
@@ -968,7 +991,7 @@
            which the cs server module was preloaded (see CFG.dynamicLibraries)
            - dlopen then returns the already-linked DSO without touching the
            filesystem. The raw.js glue gains Module.ENV support for this. */
-        ENV: { XASH3D_GAMELIBPATH: 'dlls/cs_emscripten_wasm32.so' },
+        ENV: { XASH3D_GAMELIBPATH: CFG.gameLibPath || 'dlls/cs_emscripten_wasm32.so' },
         preRun: [installHook],
         onRuntimeInitialized: onRuntime,
         /* engine stdout/stderr -> developer console (the glue honors these:
