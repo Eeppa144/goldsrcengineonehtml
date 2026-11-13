@@ -1,4 +1,6 @@
 # goldsrcengineonehtml
+## Requirements
+- Python 3.6 or newer (standard library only — no pip packages needed)
 This repository contains the build pipeline and runtime glue to package a full GoldSrc game (Counter-Strike 1.6, Half-Life 1, Day of Defeat) into a single, self-contained HTML file that runs entirely offline in the browser via WebAssembly.
 
 ⚠️ Important: No Game Assets Included
